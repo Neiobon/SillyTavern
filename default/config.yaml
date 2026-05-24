@@ -37,7 +37,7 @@ browserLaunch:
   # Use if you don't have 'localhost' in your hosts file
   avoidLocalhost: false
 # Server port
-port: 8000
+port: 8123
 # Interval in seconds to write a heartbeat file. Set to 0 to disable.
 # This is used primarily for Docker healthchecks.
 heartbeatInterval: 0
@@ -104,7 +104,7 @@ requestProxy:
     - localhost
     - 127.0.0.1
 # Enable multi-user mode
-enableUserAccounts: false
+enableUserAccounts: true
 # Enable discreet login mode: hides user list on the login screen
 enableDiscreetLogin: false
 # If `basicAuthMode` and this are enabled then
