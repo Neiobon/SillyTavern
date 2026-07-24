@@ -1773,6 +1773,502 @@ async function sendAzureOpenAIRequest(request, response) {
     }
 }
 
+/**
+ * GPT-5.6 reasoning with tools requires the Responses API. Keep this route
+ * limited to the official OpenAI endpoint because arbitrary reverse proxies
+ * may only implement Chat Completions.
+ * @param {import('express').Request} request Express request
+ * @returns {boolean} Whether the request should use the Responses API
+ */
+function isOpenAIResponsesRequest(request) {
+    return request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENAI
+        && !request.body.reverse_proxy
+        && /^gpt-5\.6(?:-sol)?$/i.test(String(request.body.model));
+}
+
+/**
+ * Convert Chat Completions message content into Responses input content.
+ * @param {any} content Chat Completions content
+ * @returns {any} Responses input content
+ */
+function convertOpenAIResponsesContent(content, role = 'user') {
+    if (typeof content === 'string' || content === null || content === undefined) {
+        return content ?? '';
+    }
+
+    if (!Array.isArray(content)) {
+        return String(content);
+    }
+
+    return content.map((part) => {
+        if (!part || typeof part !== 'object') {
+            return { type: 'input_text', text: String(part ?? '') };
+        }
+
+        if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
+            return { type: role === 'assistant' ? 'output_text' : 'input_text', text: String(part.text ?? '') };
+        }
+
+        if (part.type === 'image_url') {
+            const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+            return {
+                type: 'input_image',
+                image_url: imageUrl,
+                ...(typeof part.image_url === 'object' && part.image_url?.detail ? { detail: part.image_url.detail } : {}),
+            };
+        }
+
+        if (part.type === 'input_image') {
+            return part;
+        }
+
+        if (part.type === 'input_file' || part.type === 'file') {
+            return { ...part, type: 'input_file' };
+        }
+
+        if (part.type === 'input_audio' || part.type === 'audio') {
+            return { ...part, type: 'input_audio' };
+        }
+
+        return {
+            type: role === 'assistant' ? 'output_text' : 'input_text',
+            text: String(part.text ?? part.content ?? ''),
+        };
+    });
+}
+
+/**
+ * Convert the existing Chat Completions history to Responses input items.
+ * @param {any[]} messages Chat Completions messages
+ * @returns {any[]} Responses input items
+ */
+function convertOpenAIResponsesInput(messages) {
+    if (!Array.isArray(messages)) {
+        return [];
+    }
+
+    const input = [];
+    for (const message of messages) {
+        if (!message || typeof message !== 'object') {
+            continue;
+        }
+
+        if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+            if (message.content) {
+                input.push({
+                    type: 'message',
+                    role: 'assistant',
+                    content: convertOpenAIResponsesContent(message.content, 'assistant'),
+                });
+            }
+
+            for (const toolCall of message.tool_calls) {
+                const functionCall = toolCall?.function;
+                if (!functionCall?.name) {
+                    continue;
+                }
+
+                input.push({
+                    type: 'function_call',
+                    call_id: toolCall.id,
+                    name: functionCall.name,
+                    arguments: typeof functionCall.arguments === 'string'
+                        ? functionCall.arguments
+                        : JSON.stringify(functionCall.arguments ?? {}),
+                });
+            }
+            continue;
+        }
+
+        if (message.role === 'tool') {
+            const output = typeof message.content === 'string'
+                ? message.content
+                : JSON.stringify(message.content ?? '');
+            input.push({
+                type: 'function_call_output',
+                call_id: message.tool_call_id,
+                output,
+            });
+            continue;
+        }
+
+        const role = ['system', 'developer', 'user', 'assistant'].includes(message.role)
+            ? message.role
+            : 'user';
+        const inputMessage = {
+            type: 'message',
+            role,
+            content: convertOpenAIResponsesContent(message.content, role),
+        };
+        input.push(inputMessage);
+    }
+
+    return input;
+}
+
+/**
+ * Convert a Chat Completions function tool to a Responses function tool.
+ * @param {any} tool Chat Completions tool
+ * @returns {any} Responses tool
+ */
+function convertOpenAIResponsesTool(tool) {
+    if (tool?.type !== 'function' || !tool.function) {
+        return tool;
+    }
+
+    return {
+        type: 'function',
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+        ...(tool.function.strict !== undefined ? { strict: tool.function.strict } : {}),
+    };
+}
+
+/**
+ * Convert Chat Completions tool choice to Responses tool choice.
+ * @param {any} toolChoice Chat Completions tool choice
+ * @returns {any} Responses tool choice
+ */
+function convertOpenAIResponsesToolChoice(toolChoice) {
+    if (!toolChoice || typeof toolChoice !== 'object' || toolChoice.type !== 'function') {
+        return toolChoice;
+    }
+
+    return {
+        type: 'function',
+        name: toolChoice.function?.name ?? toolChoice.name,
+    };
+}
+
+/**
+ * Convert the application's schema settings to Responses text settings.
+ * @param {any} requestBody Generation request body
+ * @returns {any|undefined} Responses text settings
+ */
+function getOpenAIResponsesTextSettings(requestBody) {
+    const text = {};
+    if (requestBody.verbosity) {
+        text.verbosity = requestBody.verbosity;
+    }
+
+    if (requestBody.json_schema) {
+        text.format = {
+            type: 'json_schema',
+            name: requestBody.json_schema.name,
+            strict: requestBody.json_schema.strict ?? true,
+            schema: requestBody.json_schema.value,
+        };
+    }
+
+    return Object.keys(text).length > 0 ? text : undefined;
+}
+
+/**
+ * Build a Responses API request from the existing generation settings.
+ * @param {import('express').Request} request Express request
+ * @returns {object} Responses API request body
+ */
+function buildOpenAIResponsesRequest(request) {
+    const requestBody = request.body;
+    const reasoningEffort = requestBody.reasoning_effort === 'min'
+        ? 'none'
+        : OPENAI_REASONING_EFFORT_MAP[requestBody.reasoning_effort] ?? requestBody.reasoning_effort;
+    const validReasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+    const body = {
+        model: requestBody.model,
+        input: convertOpenAIResponsesInput(requestBody.messages),
+        stream: Boolean(requestBody.stream),
+        max_output_tokens: requestBody.max_completion_tokens ?? requestBody.max_tokens,
+    };
+
+    if (validReasoningEfforts.includes(reasoningEffort)) {
+        body.reasoning = { effort: reasoningEffort };
+    } else if (requestBody.include_reasoning) {
+        body.reasoning = {};
+    }
+
+    if (requestBody.include_reasoning && reasoningEffort !== 'none') {
+        body.reasoning ??= {};
+        body.reasoning.summary = 'auto';
+    }
+
+    const text = getOpenAIResponsesTextSettings(requestBody);
+    if (text) {
+        body.text = text;
+    }
+
+    if (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) {
+        body.tools = requestBody.tools.map(convertOpenAIResponsesTool);
+        if (requestBody.tool_choice) {
+            body.tool_choice = convertOpenAIResponsesToolChoice(requestBody.tool_choice);
+        }
+    }
+
+    return body;
+}
+
+/**
+ * Convert a Responses API output to the Chat Completions shape used by the UI.
+ * @param {any} data Responses API response
+ * @returns {object} Chat Completions-compatible response
+ */
+function convertOpenAIResponsesResponse(data) {
+    const output = Array.isArray(data?.output) ? data.output : [];
+    const reasoning = output
+        .filter(item => item?.type === 'reasoning')
+        .flatMap(item => Array.isArray(item.summary) ? item.summary : [])
+        .filter(summary => summary?.type === 'summary_text')
+        .map(summary => summary.text)
+        .filter(text => typeof text === 'string')
+        .join('');
+    const messages = output.filter(item => item?.type === 'message');
+    const content = messages
+        .flatMap(item => Array.isArray(item.content) ? item.content : [])
+        .filter(part => part?.type === 'output_text' || part?.type === 'text')
+        .map(part => part.text)
+        .filter(text => typeof text === 'string')
+        .join('') || (typeof data?.output_text === 'string' ? data.output_text : '');
+    const toolCalls = output
+        .filter(item => item?.type === 'function_call' && item.name)
+        .map((item, index) => ({
+            id: item.call_id ?? item.id ?? `call_${index}`,
+            type: 'function',
+            function: {
+                name: item.name,
+                arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {}),
+            },
+        }));
+
+    const response = {
+        id: data.id,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: data.model,
+        choices: [{
+            index: 0,
+            message: {
+                role: 'assistant',
+                content: content || null,
+                ...(reasoning ? { reasoning_content: reasoning } : {}),
+                ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+            },
+            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+        }],
+    };
+
+    if (data.usage) {
+        response.usage = {
+            prompt_tokens: data.usage.input_tokens,
+            completion_tokens: data.usage.output_tokens,
+            total_tokens: data.usage.total_tokens,
+            ...(data.usage.output_tokens_details ? {
+                completion_tokens_details: {
+                    reasoning_tokens: data.usage.output_tokens_details.reasoning_tokens,
+                },
+            } : {}),
+        };
+    }
+
+    return response;
+}
+
+/**
+ * Convert one Responses SSE event to a Chat Completions-compatible chunk.
+ * @param {any} event Responses SSE event
+ * @param {Map<string, {index: number, id: string, name: string}>} toolCalls Tool state
+ * @param {{nextToolIndex: number}} state Stream state
+ * @returns {object|null} Converted chunk, or null for metadata-only events
+ */
+function convertOpenAIResponsesEvent(event, toolCalls, state) {
+    const type = event?.type;
+    if (type === 'response.reasoning_summary_text.delta') {
+        return {
+            choices: [{ index: 0, delta: { reasoning_content: event.delta ?? event.text ?? '' } }],
+        };
+    }
+
+    if (type === 'response.output_text.delta') {
+        return {
+            choices: [{ index: 0, delta: { content: event.delta ?? event.text ?? '' } }],
+        };
+    }
+
+    if (type === 'response.output_item.added' && event.item?.type === 'function_call') {
+        const item = event.item;
+        const index = Number.isInteger(event.output_index) ? event.output_index : state.nextToolIndex++;
+        state.nextToolIndex = Math.max(state.nextToolIndex, index + 1);
+        const id = item.call_id ?? item.id;
+        toolCalls.set(item.id ?? id, { index, id, name: item.name });
+        return {
+            choices: [{
+                index: 0,
+                delta: {
+                    tool_calls: [{
+                        index,
+                        id,
+                        type: 'function',
+                        function: {
+                            name: item.name,
+                            arguments: item.arguments ?? '',
+                        },
+                    }],
+                },
+            }],
+        };
+    }
+
+    if (type === 'response.function_call_arguments.delta') {
+        const saved = toolCalls.get(event.item_id);
+        const index = saved?.index ?? (Number.isInteger(event.output_index) ? event.output_index : 0);
+        const id = saved?.id ?? event.item_id;
+        return {
+            choices: [{
+                index: 0,
+                delta: {
+                    tool_calls: [{
+                        index,
+                        ...(saved?.name ? {} : { id, type: 'function' }),
+                        function: { arguments: event.delta ?? '' },
+                    }],
+                },
+            }],
+        };
+    }
+
+    if (type === 'response.failed' || type === 'response.error') {
+        return { error: { message: event.error?.message ?? event.message ?? 'OpenAI Responses request failed.' } };
+    }
+
+    return null;
+}
+
+/**
+ * Forward and translate a Responses API stream.
+ * @param {import('node-fetch').Response} from Fetch response
+ * @param {import('express').Response} to Express response
+ * @returns {Promise<void>}
+ */
+async function forwardOpenAIResponsesStream(from, to) {
+    if (!from.ok) {
+        const rawErrorText = await from.text();
+        to.status(from.status === 401 ? 400 : from.status).send(rawErrorText);
+        return;
+    }
+
+    to.statusCode = from.status;
+    to.setHeader('Content-Type', 'text/event-stream');
+    to.setHeader('Cache-Control', 'no-cache');
+    to.setHeader('Connection', 'keep-alive');
+
+    let buffer = '';
+    let sentDone = false;
+    const toolCalls = new Map();
+    const state = { nextToolIndex: 0 };
+    const writeEvent = (data) => {
+        if (data?.error) {
+            to.write(`data: ${JSON.stringify(data)}\n\n`);
+            return;
+        }
+        if (data) {
+            to.write(`data: ${JSON.stringify(data)}\n\n`);
+        }
+    };
+    const finish = () => {
+        if (!sentDone) {
+            to.write('data: [DONE]\n\n');
+            sentDone = true;
+        }
+    };
+    const processEvent = (rawEvent) => {
+        const dataLines = rawEvent.split(/\r?\n/)
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart());
+        if (dataLines.length === 0) {
+            return;
+        }
+
+        const rawData = dataLines.join('\n');
+        if (rawData === '[DONE]') {
+            finish();
+            return;
+        }
+
+        let parsed;
+        try {
+            parsed = JSON.parse(rawData);
+        } catch {
+            return;
+        }
+
+        writeEvent(convertOpenAIResponsesEvent(parsed, toolCalls, state));
+        if (['response.completed', 'response.incomplete', 'response.failed', 'response.error'].includes(parsed?.type)) {
+            finish();
+        }
+    };
+
+    for await (const chunk of from.body) {
+        buffer += Buffer.from(chunk).toString('utf8');
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() ?? '';
+        events.forEach(processEvent);
+        if (sentDone) {
+            break;
+        }
+    }
+
+    if (buffer.trim()) {
+        processEvent(buffer);
+    }
+    finish();
+    to.end();
+}
+
+/**
+ * Send a GPT-5.6 request through the OpenAI Responses API.
+ * @param {import('express').Request} request Express request
+ * @param {import('express').Response} response Express response
+ * @param {string} apiUrl OpenAI API base URL
+ * @param {string} apiKey OpenAI API key
+ * @returns {Promise<void>}
+ */
+async function sendOpenAIResponsesRequest(request, response, apiUrl, apiKey) {
+    if (!apiKey) {
+        return response.status(400).send({ error: true });
+    }
+
+    const controller = new AbortController();
+    request.socket.removeAllListeners('close');
+    request.socket.on('close', () => controller.abort());
+    const requestBody = buildOpenAIResponsesRequest(request);
+    const endpointUrl = urlJoin(apiUrl, 'responses');
+    const config = {
+        method: 'post',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey,
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+    };
+
+    console.debug('OpenAI Responses request:', requestBody);
+    const fetchResponse = await fetch(endpointUrl, config);
+    if (request.body.stream) {
+        return await forwardOpenAIResponsesStream(fetchResponse, response);
+    }
+
+    if (fetchResponse.ok) {
+        const json = await fetchResponse.json();
+        console.debug('OpenAI Responses response:', json);
+        return response.send(convertOpenAIResponsesResponse(json));
+    }
+
+    const responseText = await fetchResponse.text();
+    const errorData = tryParse(responseText);
+    return response.status(fetchResponse.status).send(errorData ?? { error: { message: responseText || fetchResponse.statusText } });
+}
+
 export const router = express.Router();
 
 router.post('/status', async function (request, statusResponse) {
@@ -2618,6 +3114,10 @@ router.post('/generate', async function (request, response) {
         if (!apiKey && !request.body.reverse_proxy && request.body.chat_completion_source !== CHAT_COMPLETION_SOURCES.CUSTOM) {
             console.warn('OpenAI API key is missing.');
             return response.status(400).send({ error: true });
+        }
+
+        if (isOpenAIResponsesRequest(request)) {
+            return await sendOpenAIResponsesRequest(request, response, apiUrl, apiKey);
         }
 
         // Add custom stop sequences

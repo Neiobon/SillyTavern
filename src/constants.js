@@ -510,6 +510,7 @@ export const NANOGPT_REASONING_EFFORT_MAP = {
     low: 'minimal',
     medium: 'low',
     high: 'medium',
+    xhigh: 'high',
     max: 'high',
 };
 

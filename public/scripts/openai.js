@@ -242,6 +242,7 @@ export const reasoning_effort_types = {
     medium: 'medium',
     high: 'high',
     min: 'min',
+    xhigh: 'xhigh',
     max: 'max',
 };
 
@@ -2630,7 +2631,15 @@ function getReasoningEffort(settings = null, model = null) {
                 }
 
                 return reasoning_effort_types.low;
+            case reasoning_effort_types.xhigh:
+                return reasoning_effort_types.xhigh;
             case reasoning_effort_types.max:
+                if (settings.chat_completion_source === chat_completion_sources.OPENAI
+                    && !settings.reverse_proxy
+                    && /^gpt-5\.6(?:-sol)?$/i.test(String(model))) {
+                    // The local Responses API route supports the full max effort level.
+                    return reasoning_effort_types.max;
+                }
                 if ([chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source)
                     && /^gpt-6-astra/.test(model)) {
                     return reasoning_effort_types.max;
@@ -2785,7 +2794,13 @@ export async function createGenerationParameters(settings, model, type, messages
     const stream = settings.stream_openai && type !== 'quiet' && !isO1 && !isWorkersAIJsonMode;
 
     const noMultiSwipeTypes = ['quiet', 'impersonate', 'continue'];
-    const canMultiSwipe = settings.n > 1 && !noMultiSwipeTypes.includes(type) && multiswipeSources.includes(settings.chat_completion_source);
+    const usesOpenAIResponses = settings.chat_completion_source === chat_completion_sources.OPENAI
+        && !settings.reverse_proxy
+        && /^gpt-5\.6(?:-sol)?$/i.test(String(model));
+    const canMultiSwipe = settings.n > 1
+        && !noMultiSwipeTypes.includes(type)
+        && multiswipeSources.includes(settings.chat_completion_source)
+        && !usesOpenAIResponses;
 
     let logit_bias = {};
     if (settings.bias_preset_selected
@@ -3256,6 +3271,14 @@ export function getStreamingReply(data, state, { chatCompletionSource = null, ov
             state.reasoning += (data.choices?.filter(x => x?.delta?.reasoning_content)?.[0]?.delta?.reasoning_content || '');
         }
         return data.choices?.[0]?.delta?.content || '';
+    } else if (chat_completion_source === chat_completion_sources.OPENAI) {
+        if (show_thoughts) {
+            state.reasoning +=
+                data.choices?.filter(x => x?.delta?.reasoning_content)?.[0]?.delta?.reasoning_content ??
+                data.choices?.filter(x => x?.message?.reasoning_content)?.[0]?.message?.reasoning_content ??
+                '';
+        }
+        return data.choices?.[0]?.delta?.content ?? data.choices?.[0]?.message?.content ?? '';
     } else if (chat_completion_source === chat_completion_sources.OPENROUTER) {
         const imageUrls = data?.choices?.[0]?.delta?.images?.filter(x => x.type === 'image_url')?.map(x => x?.image_url?.url) || [];
         if (Array.isArray(imageUrls) && imageUrls.length > 0) {
