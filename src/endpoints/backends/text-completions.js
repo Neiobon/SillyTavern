@@ -359,10 +359,10 @@ router.post('/generate', async function (request, response) {
         }
 
         if (request.body.api_type === TEXTGEN_TYPES.OPENROUTER) {
-            if (Array.isArray(request.body.provider) && request.body.provider.length > 0) {
+            if ((Array.isArray(request.body.provider) && request.body.provider.length > 0) || request.body.allow_fallbacks === false) {
                 request.body.provider = {
                     allow_fallbacks: request.body.allow_fallbacks ?? true,
-                    order: request.body.provider,
+                    order: request.body.provider ?? [],
                 };
             } else {
                 delete request.body.provider;

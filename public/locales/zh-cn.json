@@ -3644,5 +3644,13 @@
     "Deleting chat…": "正在删除聊天…",
     "Loading chat…": "正在加载聊天…",
     "Bulk Delete": "批量删除",
-    "Deleting ${0} character(s)…": "正在删除 ${0} 个角色…"
+    "Deleting ${0} character(s)…": "正在删除 ${0} 个角色…",
+    "OpenRouter Service Tier": "OpenRouter 服务层级",
+    "Automatic (provider routing)": "自动（由 OpenRouter 路由决定）",
+    "Standard tier (default)": "标准层级（default）",
+    "Flex (lower cost)": "Flex（较低费用）",
+    "Priority (fast)": "优先处理（priority）",
+    "Fast (alias of priority)": "Fast（priority 的别名）",
+    "Ultrafast": "超高速（ultrafast）",
+    "OpenRouter service tier routing help": "自动：不指定层级。标准：禁用 :nitro/:floor 引入的额外层级。Priority 和 Ultrafast 可能回退至标准层级并按实际层级计费；Flex 仅回退至输入、输出单价均不高于 Flex 的端点，没有 Flex 端点时按标准路由处理。"
 }

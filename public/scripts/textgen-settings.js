@@ -225,6 +225,7 @@ export const textgenerationwebui_settings = {
     custom_model: '',
     bypass_status_check: false,
     openrouter_allow_fallbacks: true,
+    openrouter_service_tier: '',
     xtc_threshold: 0.1,
     xtc_probability: 0,
     nsigma: 0.0,
@@ -311,6 +312,7 @@ export const setting_names = [
     'custom_model',
     'bypass_status_check',
     'openrouter_allow_fallbacks',
+    'openrouter_service_tier',
     'xtc_threshold',
     'xtc_probability',
     'nsigma',
@@ -1035,7 +1037,7 @@ export function initTextGenSettings() {
         $(`#${i}_textgenerationwebui`).attr('x-setting-id', i);
         $(document).on('input', `#${i}_textgenerationwebui`, function () {
             const isCheckbox = $(this).attr('type') == 'checkbox';
-            const isText = $(this).attr('type') == 'text' || $(this).is('textarea');
+            const isText = $(this).attr('type') == 'text' || $(this).is('textarea') || i === 'openrouter_service_tier';
             const id = $(this).attr('x-setting-id');
 
             if (isCheckbox) {
@@ -1250,7 +1252,7 @@ function setSettingByName(setting, value, trigger) {
     }
 
     const isCheckbox = $(`#${setting}_textgenerationwebui`).attr('type') == 'checkbox';
-    const isText = $(`#${setting}_textgenerationwebui`).attr('type') == 'text' || $(`#${setting}_textgenerationwebui`).is('textarea');
+    const isText = $(`#${setting}_textgenerationwebui`).attr('type') == 'text' || $(`#${setting}_textgenerationwebui`).is('textarea') || setting === 'openrouter_service_tier';
     if (isCheckbox) {
         const val = Boolean(value);
         $(`#${setting}_textgenerationwebui`).prop('checked', val);
@@ -1753,6 +1755,7 @@ export function createTextGenGenerationData(settings, model, finalPrompt = null,
         params.provider = settings.openrouter_providers;
         params.quantizations = settings.openrouter_quantizations;
         params.allow_fallbacks = settings.openrouter_allow_fallbacks;
+        params.service_tier = settings.openrouter_service_tier || undefined;
     }
 
     if (settings.type === KOBOLDCPP) {

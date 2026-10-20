@@ -2489,6 +2489,18 @@
                                     </select>
                                 </div>
                                 <div>
+                                    <h4><label for="openrouter_service_tier_textgenerationwebui" data-i18n="OpenRouter Service Tier">OpenRouter Service Tier</label></h4>
+                                    <select id="openrouter_service_tier_textgenerationwebui">
+                                        <option value="" data-i18n="Automatic (provider routing)">Automatic (provider routing)</option>
+                                        <option value="default" data-i18n="Standard tier (default)">Standard tier (default)</option>
+                                        <option value="flex" data-i18n="Flex (lower cost)">Flex (lower cost)</option>
+                                        <option value="priority" data-i18n="Priority (fast)">Priority (fast)</option>
+                                        <option value="fast" data-i18n="Fast (alias of priority)">Fast (alias of priority)</option>
+                                        <option value="ultrafast" data-i18n="Ultrafast">Ultrafast</option>
+                                    </select>
+                                    <small data-i18n="OpenRouter service tier routing help">Automatic leaves tier selection to OpenRouter. Standard disables tier admission from :nitro/:floor. Priority and Ultrafast may fall back to standard rates; Flex limits fallback by price, or uses standard routing if no flex endpoint exists.</small>
+                                </div>
+                                <div>
                                     <h4>
                                         <span data-i18n="Model Providers">Model Providers</span>
                                         <i id="openrouter_provider_warning_text" class="fa-solid fa-circle-exclamation displayNone" title="Deselect inapplicable provider(s) or select an applicable provider to avoid a 404 error."></i>
@@ -3230,6 +3242,18 @@
                                 <select id="model_openrouter_select">
                                     <option value="" data-i18n="-- Connect to the API --">-- Connect to the API --</option>
                                 </select>
+                            </div>
+                            <div>
+                                <h4><label for="openrouter_service_tier" data-i18n="OpenRouter Service Tier">OpenRouter Service Tier</label></h4>
+                                <select id="openrouter_service_tier">
+                                    <option value="" data-i18n="Automatic (provider routing)">Automatic (provider routing)</option>
+                                    <option value="default" data-i18n="Standard tier (default)">Standard tier (default)</option>
+                                    <option value="flex" data-i18n="Flex (lower cost)">Flex (lower cost)</option>
+                                    <option value="priority" data-i18n="Priority (fast)">Priority (fast)</option>
+                                    <option value="fast" data-i18n="Fast (alias of priority)">Fast (alias of priority)</option>
+                                    <option value="ultrafast" data-i18n="Ultrafast">Ultrafast</option>
+                                </select>
+                                <small data-i18n="OpenRouter service tier routing help">Automatic leaves tier selection to OpenRouter. Standard disables tier admission from :nitro/:floor. Priority and Ultrafast may fall back to standard rates; Flex limits fallback by price, or uses standard routing if no flex endpoint exists.</small>
                             </div>
                             <label for="openrouter_use_fallback" class="checkbox_label marginTopBot5" data-i18n="[title]Allow fallback routes Description" title="Automatically chooses an alternative model if the chosen model can't serve your request.">
                                 <input id="openrouter_use_fallback" type="checkbox" />

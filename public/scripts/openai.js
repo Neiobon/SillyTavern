@@ -323,6 +323,7 @@ export const settingsToUpdate = {
     openrouter_providers: ['#openrouter_providers_chat', 'openrouter_providers', false, true],
     openrouter_quantizations: ['#openrouter_quantizations_chat', 'openrouter_quantizations', false, true],
     openrouter_allow_fallbacks: ['#openrouter_allow_fallbacks', 'openrouter_allow_fallbacks', true, true],
+    openrouter_service_tier: ['#openrouter_service_tier', 'openrouter_service_tier', false, true],
     openrouter_middleout: ['#openrouter_middleout', 'openrouter_middleout', false, true],
     tool_reasoning_mode: ['#tool_reasoning_mode', 'tool_reasoning_mode', false, false],
     ai21_model: ['#model_ai21_select', 'ai21_model', false, true],
@@ -482,6 +483,7 @@ const default_settings = {
     openrouter_providers: [],
     openrouter_quantizations: [],
     openrouter_allow_fallbacks: true,
+    openrouter_service_tier: '',
     openrouter_middleout: openrouter_middleout_types.ON,
     tool_reasoning_mode: tool_reasoning_modes.DISABLED,
     reverse_proxy: '',
@@ -2905,6 +2907,7 @@ export async function createGenerationParameters(settings, model, type, messages
         generate_data.provider = settings.openrouter_providers;
         generate_data.quantizations = settings.openrouter_quantizations;
         generate_data.allow_fallbacks = settings.openrouter_allow_fallbacks;
+        generate_data.service_tier = settings.openrouter_service_tier || undefined;
         generate_data.middleout = settings.openrouter_middleout;
     }
 
@@ -7047,6 +7050,11 @@ export function initOpenAI() {
 
     $('#openrouter_middleout').on('input', function () {
         oai_settings.openrouter_middleout = String($(this).val());
+        saveSettingsDebounced();
+    });
+
+    $('#openrouter_service_tier').on('change', function () {
+        oai_settings.openrouter_service_tier = String($(this).val());
         saveSettingsDebounced();
     });
 

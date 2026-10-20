@@ -2802,6 +2802,7 @@ router.post('/generate', async function (request, response) {
             const includeReasoning = Boolean(request.body.include_reasoning);
             bodyParams = {
                 transforms: getOpenRouterTransforms(request),
+                service_tier: request.body.service_tier || undefined,
                 plugins: getOpenRouterPlugins(request),
                 reasoning: {
                     exclude: !includeReasoning,
@@ -2825,7 +2826,7 @@ router.post('/generate', async function (request, response) {
                 bodyParams['repetition_penalty'] = request.body.repetition_penalty;
             }
 
-            if (Array.isArray(request.body.provider) && request.body.provider.length > 0) {
+            if ((Array.isArray(request.body.provider) && request.body.provider.length > 0) || request.body.allow_fallbacks === false) {
                 bodyParams['provider'] = {
                     allow_fallbacks: request.body.allow_fallbacks ?? true,
                     order: request.body.provider ?? [],

@@ -374,6 +374,7 @@ export const FEATHERLESS_HEADERS = {
 };
 
 export const OPENROUTER_KEYS = [
+    'service_tier',
     'max_tokens',
     'temperature',
     'top_k',
