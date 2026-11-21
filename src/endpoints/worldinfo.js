@@ -6,6 +6,7 @@ import sanitize from 'sanitize-filename';
 import _ from 'lodash';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { tryParse } from '../util.js';
+import { getWorldInfoVersion, readWorldInfoSnapshot, WORLD_INFO_VERSION_HEADER } from '../world-info-sync.js';
 
 /**
  * Reads a World Info file and returns its contents
@@ -73,9 +74,21 @@ router.post('/get', (request, response) => {
         return response.sendStatus(400);
     }
 
-    const file = readWorldInfoFile(request.user.directories, request.body.name, true);
+    const { data, version } = readWorldInfoSnapshot(request.user.directories, request.body.name);
+    response.set(WORLD_INFO_VERSION_HEADER, version);
+    return response.send(data);
+});
 
-    return response.send(file);
+router.post('/versions', (request, response) => {
+    if (!Array.isArray(request.body?.names) || request.body.names.length > 1000
+        || request.body.names.some(name => typeof name !== 'string' || !name)) {
+        return response.sendStatus(400);
+    }
+
+    const versions = Object.fromEntries(request.body.names.map(name => [
+        name, readWorldInfoSnapshot(request.user.directories, name).version,
+    ]));
+    return response.send(versions);
 });
 
 router.post('/delete', (request, response) => {
@@ -87,10 +100,16 @@ router.post('/delete', (request, response) => {
     const filename = sanitize(`${worldInfoName}.json`);
     const pathToWorldInfo = path.join(request.user.directories.worlds, filename);
 
+    if (Object.hasOwn(request.body, 'baseVersion')) {
+        const current = readWorldInfoSnapshot(request.user.directories, worldInfoName);
+        if (request.body.baseVersion !== current.version) {
+            response.set(WORLD_INFO_VERSION_HEADER, current.version);
+            return response.status(409).send(current);
+        }
+    }
     if (!fs.existsSync(pathToWorldInfo)) {
         throw new Error(`World info file ${filename} doesn't exist.`);
     }
-
     fs.unlinkSync(pathToWorldInfo);
 
     return response.sendStatus(200);
@@ -151,7 +170,18 @@ router.post('/edit', (request, response) => {
     const filename = sanitize(`${request.body.name}.json`);
     const pathToFile = path.join(request.user.directories.worlds, filename);
 
-    writeFileAtomicSync(pathToFile, JSON.stringify(request.body.data, null, 4));
+    // No await between reading the version and writing: concurrent requests cannot interleave.
+    if (Object.hasOwn(request.body, 'baseVersion')) {
+        const current = readWorldInfoSnapshot(request.user.directories, request.body.name);
+        if (request.body.baseVersion !== current.version) {
+            response.set(WORLD_INFO_VERSION_HEADER, current.version);
+            return response.status(409).send(current);
+        }
+    }
 
-    return response.send({ ok: true });
+    const contents = JSON.stringify(request.body.data, null, 4);
+    writeFileAtomicSync(pathToFile, contents);
+    const version = getWorldInfoVersion(contents);
+    response.set(WORLD_INFO_VERSION_HEADER, version);
+    return response.send({ ok: true, version });
 });
