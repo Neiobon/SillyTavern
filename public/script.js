@@ -269,7 +269,7 @@ import { initServerHistory } from './scripts/server-history.js';
 import { initSettingsSearch } from './scripts/setting-search.js';
 import { initBulkEdit } from './scripts/bulk-edit.js';
 import { getContext } from './scripts/st-context.js';
-import { extractReasoningFromData, extractReasoningSignatureFromData, initReasoning, parseReasoningInSwipes, PromptReasoning, ReasoningHandler, removeReasoningFromString, updateReasoningUI } from './scripts/reasoning.js';
+import { extractReasoningFromData, extractReasoningSignatureFromData, initReasoning, parseReasoningFromString, parseReasoningInSwipes, PromptReasoning, ReasoningHandler, removeReasoningFromString, updateReasoningUI } from './scripts/reasoning.js';
 import { accountStorage } from './scripts/util/AccountStorage.js';
 import { initWelcomeScreen, openPermanentAssistantChat, openPermanentAssistantCard, getPermanentAssistantAvatar } from './scripts/welcome-screen.js';
 import { initDataMaid } from './scripts/data-maid.js';
@@ -278,6 +278,7 @@ import { getSystemMessageByType, initSystemMessages, SAFETY_CHAT, sendSystemMess
 import { event_types, eventSource } from './scripts/events.js';
 import { initAccessibility } from './scripts/a11y.js';
 import { applyStreamFadeIn } from './scripts/util/stream-fadein.js';
+import { beginGenerationSession, commitGenerationSession, endGenerationSession, initChatSessionGuard, markGenerationFinalizing, markGenerationFinishing, persistDetachedSession, prepareChatSwitch, restoreBackgroundChat, resumeBackgroundChat, waitForForegroundRelease } from './scripts/chat-session-guard.js';
 import { initDomHandlers } from './scripts/dom-handlers.js';
 import { SimpleMutex } from './scripts/util/SimpleMutex.js';
 import { AudioPlayer } from './scripts/audio-player.js';
@@ -780,6 +781,7 @@ async function firstLoadInit() {
     initCustomSelectedSamplers();
     initDataMaid();
     initItemizedPrompts();
+    initChatSessionGuard();
     initAccessibility();
     initSwipePicker();
     addDebugFunctions();
@@ -889,6 +891,8 @@ export async function selectCharacterById(id, { switchMenu = true } = {}) {
     if (selected_group || String(this_chid) !== String(id)) {
         //if clicked on a different character from what was currently selected
         if (!is_send_press) {
+            // Let a reply that is being written into the current chat finish first
+            await prepareChatSwitch();
             setCharacterId(undefined);
             setCharacterName('');
             resetSelectedGroup();
@@ -1584,6 +1588,10 @@ export function cancelDebouncedChatSave() {
  * @param {boolean} [options.clearData=false] Optionally clear the chat array's contents.
  */
 export async function clearChat({ clearData = false } = {}) {
+    if (clearData) {
+        // A generation running in this chat continues in the background.
+        await prepareChatSwitch();
+    }
     cancelDebouncedChatSave();
     cancelDebouncedMetadataSave();
     closeMessageEditor();
@@ -3583,6 +3591,33 @@ class StreamingProcessor {
         this.images = [];
         /** @type {string?} */
         this.reasoningSignature = null;
+        /** @type {string?} Latest reasoning received from the API, kept while detached */
+        this.rawReasoning = null;
+        /** @type {import('./scripts/chat-session-guard.js').GenerationSession?} */
+        this.session = null;
+    }
+
+    /**
+     * True if the user switched to another chat and this generation runs in the background.
+     * A detached processor must not touch the open chat or the UI.
+     * @returns {boolean}
+     */
+    get isDetached() {
+        return !!this.session?.detached;
+    }
+
+    /**
+     * Drops cached DOM elements, so they are looked up again after the chat is re-rendered.
+     */
+    resetDomCache() {
+        this.messageDom = null;
+        this.messageTextDom = null;
+        this.messageTimerDom = null;
+        this.messageTokenCounterDom = null;
+        this.reasoningHandler.messageDom = null;
+        this.reasoningHandler.messageReasoningDetailsDom = null;
+        this.reasoningHandler.messageReasoningContentDom = null;
+        this.reasoningHandler.messageReasoningHeaderDom = null;
     }
 
     /**
@@ -3631,6 +3666,10 @@ class StreamingProcessor {
             this.sendTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
             await saveReply({ type: this.type, getMessage: text, fromStreaming: true });
+            if (this.isDetached) {
+                // The chat was switched while the placeholder was being added. It went into the snapshot.
+                return this.session.ownerChat.length - 1;
+            }
             messageId = chat.length - 1;
             await this.#checkDomElements(messageId, continueOnReasoning);
             this.markUIGenStarted();
@@ -3641,6 +3680,10 @@ class StreamingProcessor {
     }
 
     async onProgressStreaming(messageId, text, isFinal) {
+        if (this.isDetached) {
+            return;
+        }
+
         const isImpersonate = this.type == 'impersonate';
         const isContinue = this.type == 'continue';
 
@@ -3676,47 +3719,61 @@ class StreamingProcessor {
             this.sendTextarea.value = processedText;
             this.sendTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
-            const mesChanged = chat[messageId].mes !== processedText;
+            // Keep a reference: chat[messageId] may point to another chat after an await.
+            const message = chat[messageId];
+            if (!message) {
+                return;
+            }
+            const mesChanged = message.mes !== processedText;
             await this.#checkDomElements(messageId);
+            if (this.isDetached) {
+                return;
+            }
             this.#updateMessageBlockVisibility();
             const currentTime = new Date();
-            chat[messageId].mes = processedText;
-            chat[messageId].gen_started = this.timeStarted;
-            chat[messageId].gen_finished = currentTime;
-            if (!chat[messageId].extra) {
-                chat[messageId].extra = {};
+            message.mes = processedText;
+            message.gen_started = this.timeStarted;
+            message.gen_finished = currentTime;
+            if (!message.extra) {
+                message.extra = {};
             }
-            chat[messageId].extra.time_to_first_token = this.timeToFirstToken;
+            message.extra.time_to_first_token = this.timeToFirstToken;
 
             // Update reasoning
             await this.reasoningHandler.process(messageId, mesChanged, this.promptReasoning);
-            processedText = chat[messageId].mes;
+            if (this.isDetached) {
+                return;
+            }
+            processedText = message.mes;
 
             // Token count update.
             const tokenCountText = this.reasoningHandler.reasoning + processedText;
             const currentTokenCount = isFinal && power_user.message_token_count_enabled ? await getTokenCountAsync(tokenCountText, 0) : 0;
+            if (this.isDetached) {
+                return;
+            }
             if (currentTokenCount) {
-                chat[messageId].extra.token_count = currentTokenCount;
+                message.extra.token_count = currentTokenCount;
                 if (this.messageTokenCounterDom instanceof HTMLElement) {
                     this.messageTokenCounterDom.textContent = `${currentTokenCount}t`;
                 }
             }
 
-            if ((this.type == 'swipe' || this.type === 'continue') && Array.isArray(chat[messageId].swipes)) {
-                chat[messageId].swipes[chat[messageId].swipe_id] = processedText;
-                chat[messageId].swipe_info[chat[messageId].swipe_id] = {
-                    'send_date': chat[messageId].send_date,
-                    'gen_started': chat[messageId].gen_started,
-                    'gen_finished': chat[messageId].gen_finished,
-                    'extra': structuredClone(chat[messageId].extra),
+            if ((this.type == 'swipe' || this.type === 'continue') && Array.isArray(message.swipes)) {
+                message.swipes[message.swipe_id] = processedText;
+                message.swipe_info[message.swipe_id] = {
+                    'send_date': message.send_date,
+                    'gen_started': message.gen_started,
+                    'gen_finished': message.gen_finished,
+                    'extra': structuredClone(message.extra),
                 };
             }
 
             const formattedText = messageFormatting(
                 processedText,
-                chat[messageId].name,
-                chat[messageId].is_system,
-                chat[messageId].is_user,
+                message.name,
+                message.is_system,
+                message.is_user,
                 messageId,
                 {},
                 false,
@@ -3808,6 +3865,11 @@ class StreamingProcessor {
     async onFinishStreaming(messageId, text) {
         await this.finalizeIntermediaryMessage(messageId, text, { unlockUI: true });
 
+        // The chat was switched before this was done; the original chat is already saved.
+        if (this.session?.abandoned) {
+            return;
+        }
+
         const isAborted = this.abortController.signal.aborted;
         if (!isAborted && power_user.auto_swipe && generatedTextFiltered(text)) {
             return await swipe(null, SWIPE_DIRECTION.RIGHT, { source: SWIPE_SOURCE.AUTO_SWIPE, repeated: true, forceMesId: chat.length - 1 });
@@ -3820,6 +3882,10 @@ class StreamingProcessor {
     onErrorStreaming() {
         this.abortController.abort();
         this.isStopped = true;
+
+        if (this.isDetached) {
+            return;
+        }
 
         this.markUIGenStopped();
 
@@ -3857,7 +3923,7 @@ class StreamingProcessor {
     }
 
     async generate() {
-        if (this.messageId == -1) {
+        if (this.messageId == -1 && !this.isDetached) {
             this.messageId = await this.onStartStreaming(this.firstMessageText);
             await delay(1); // delay for message to be rendered
             scrollLock = false;
@@ -3889,9 +3955,18 @@ class StreamingProcessor {
                     this.messageLogprobs.push(...(Array.isArray(logprobs) ? logprobs : [logprobs]));
                 }
                 // Get the updated reasoning string into the handler
-                this.reasoningHandler.updateReasoning(this.messageId, state?.reasoning);
                 this.images = state?.images ?? [];
                 this.reasoningSignature = state?.signature ?? null;
+                this.rawReasoning = state?.reasoning ?? this.rawReasoning;
+                if (this.isDetached) {
+                    continue;
+                }
+                if (this.messageId == -1) {
+                    // Re-attached before the placeholder message was added.
+                    this.messageId = await this.onStartStreaming(this.firstMessageText);
+                    await delay(1);
+                }
+                this.reasoningHandler.updateReasoning(this.messageId, state?.reasoning);
                 await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED, text);
                 await sw.tick(async () => await this.onProgressStreaming(this.messageId, this.continueMessage + text));
             }
@@ -4287,7 +4362,27 @@ function removeLastMessage() {
  * @param {boolean} dryRun Whether to actually generate a message or just assemble the prompt
  * @returns {Promise<any>} Returns a promise that resolves when the text is done generating.
  */
-export async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema = null, depth = 0 } = {}, dryRun = false) {
+export async function Generate(type, options = {}, dryRun = false) {
+    /** @type {{ current: import('./scripts/chat-session-guard.js').GenerationSession? }} */
+    const sessionRef = { current: null };
+    try {
+        return await generateInChat(sessionRef, type, options, dryRun);
+    } finally {
+        if (sessionRef.current) {
+            endGenerationSession(sessionRef.current);
+        }
+    }
+}
+
+/**
+ * Body of {@link Generate}.
+ * @param {{ current: import('./scripts/chat-session-guard.js').GenerationSession? }} sessionRef Receives the chat session of the generation
+ * @param {string} type Generation type
+ * @param {GenerateOptions} options Generation options
+ * @param {boolean} dryRun Whether to actually generate a message or just assemble the prompt
+ * @returns {Promise<any>}
+ */
+async function generateInChat(sessionRef, type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema = null, depth = 0 } = {}, dryRun = false) {
     console.log('Generate entered');
     setGenerationProgress(0);
     generation_started = new Date();
@@ -4392,6 +4487,17 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         is_send_press = false;
         return Promise.resolve();
     }
+
+    // Bind the reply to the open chat, so switching chats mid-generation can't redirect it.
+    const session = (!dryRun && type !== 'quiet' && !isImpersonate) ? beginGenerationSession({
+        avatar: characters[this_chid]?.avatar ?? null,
+        characterName: characters[this_chid]?.name ?? '',
+        name2: name2,
+        generationStarted: generation_started,
+        groupGenerationId: group_generation_id,
+        forceAvatar: characters[this_chid]?.avatar && characters[this_chid].avatar !== 'none' ? getThumbnailUrl('avatar', characters[this_chid].avatar) : 'img/ai4.png',
+    }) : null;
+    sessionRef.current = session;
 
     const lastMessage = chat[chat.length - 1];
 
@@ -5327,6 +5433,11 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @throws {Error|object} Error with message text, or Error with response JSON (OAI/Horde), or the actual response JSON (novel|textgenerationwebui|kobold)
      */
     async function finishGenerating() {
+        // The chat was switched while the prompt was being built and the switch could not wait.
+        if (session?.abandoned) {
+            return;
+        }
+
         if (power_user.console_log_prompts) {
             console.log(generate_data.prompt);
         }
@@ -5371,6 +5482,14 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             examplesCount: main_api !== 'openai' ? (pinExmString ? mesExamplesArray.length : count_exm_add) : oaiMessageExamples.length,
         };
 
+        // Prompt is built. From here on, a chat switch detaches the generation instead of waiting for it.
+        if (session?.abandoned) {
+            return;
+        }
+        if (session) {
+            commitGenerationSession(session, { abortController, api: getGeneratingApi(), model: getGeneratingModel() });
+        }
+
         //console.log(additionalPromptStuff);
         const itemizedIndex = itemizedPrompts.findIndex((item) => item.mesId === additionalPromptStuff.mesId);
 
@@ -5384,16 +5503,30 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         if (isStreamingEnabled() && type !== 'quiet') {
             continue_mag = promptReasoning.removePrefix(continue_mag);
-            streamingProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
+            const processor = streamingProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
+            if (session) {
+                processor.session = session;
+                session.processor = processor;
+            }
             if (isContinue) {
                 // Save reply does add cycle text to the prompt, so it's not needed here
-                streamingProcessor.firstMessageText = '';
+                processor.firstMessageText = '';
             }
 
-            streamingProcessor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
+            processor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
 
-            hideSwipeButtons();
-            let getMessage = await streamingProcessor.generate();
+            if (!processor.isDetached) {
+                hideSwipeButtons();
+            }
+            let getMessage = await processor.generate();
+
+            if (processor.isDetached) {
+                return await finishDetachedGeneration(session, { type, isContinue, text: isContinue ? continue_mag + getMessage : getMessage });
+            }
+            if (session) {
+                markGenerationFinishing(session);
+            }
+
             let messageChunk = cleanUpMessage({
                 getMessage: getMessage,
                 isImpersonate: isImpersonate,
@@ -5418,6 +5551,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 const invocationResult = await ToolManager.invokeFunctionTools(streamingProcessor.toolCalls, {
                     reasoningText: streamingProcessor.reasoningHandler.reasoning,
                 });
+                if (session?.abandoned) {
+                    return;
+                }
                 const shouldStopGeneration = (!invocationResult.invocations.length && shouldDeleteMessage) || invocationResult.stealthCalls.length;
                 if (hasToolCalls) {
                     if (shouldStopGeneration) {
@@ -5438,6 +5574,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
             if (isStreamFinished) {
                 await streamingProcessor.onFinishStreaming(streamingProcessor.messageId, getMessage);
+                if (session?.abandoned) {
+                    return;
+                }
                 streamingProcessor = null;
                 triggerAutoContinue(messageChunk, isImpersonate);
                 return Object.defineProperties(new String(getMessage), {
@@ -5463,6 +5602,13 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         if (data?.fromStream) {
             return data;
+        }
+
+        if (session?.detached) {
+            return await finishDetachedGeneration(session, { type: originalType, isContinue, data, continueMessage: promptReasoning.removePrefix(continue_mag) });
+        }
+        if (session) {
+            markGenerationFinishing(session);
         }
 
         let messageChunk = '';
@@ -5538,6 +5684,11 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             parseAndSaveLogprobs(data, continue_mag);
         }
 
+        // The chat was switched before this was done; the original chat is already saved.
+        if (session?.abandoned) {
+            return;
+        }
+
         if (canPerformToolCalls) {
             const hasToolCalls = ToolManager.hasToolCalls(data);
             const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(getMessage) && !reasoning;
@@ -5588,6 +5739,10 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @throws {Error|object} Re-throws the exception
      */
     function onError(exception) {
+        if (session?.detached) {
+            return finishDetachedGeneration(session, { type: originalType, isContinue, error: exception });
+        }
+
         // if the response JSON was thrown (novel|textgenerationwebui|kobold), show the error message
         if (typeof exception?.error?.message === 'string') {
             toastr.error(exception.error.message, t`Text generation error`, { timeOut: 10000, extendedTimeOut: 20000 });
@@ -5617,6 +5772,266 @@ export function stopGeneration() {
     }
     eventSource.emit(event_types.GENERATION_STOPPED);
     return stopped;
+}
+
+/**
+ * Hands the generation UI over to the newly opened chat after a generation was detached.
+ * @param {import('./scripts/chat-session-guard.js').GenerationSession} session Detached session
+ */
+export function releaseGenerationForeground(session) {
+    if (streamingProcessor && streamingProcessor === session.processor) {
+        streamingProcessor = null;
+    }
+    if (abortController === session.abortController) {
+        abortController = new AbortController();
+    }
+    activateSendButtons();
+    setGenerationProgress(0);
+}
+
+/**
+ * Gives the generation UI back to a re-attached generation.
+ * @param {import('./scripts/chat-session-guard.js').GenerationSession} session Re-attached session
+ */
+export function reclaimGenerationForeground(session) {
+    if (session.processor) {
+        session.processor.resetDomCache();
+        streamingProcessor = session.processor;
+    }
+    if (session.abortController) {
+        abortController = session.abortController;
+    }
+    is_send_press = true;
+    deactivateSendButtons();
+}
+
+/**
+ * Runs a synchronous function with the character globals of a detached generation,
+ * so text clean-up (name trimming, character regex) uses the right character.
+ * @template T
+ * @param {import('./scripts/chat-session-guard.js').GenerationSession} session
+ * @param {() => T} fn
+ * @returns {T}
+ */
+function withSessionCharacter(session, fn) {
+    const previousChid = this_chid;
+    const previousName2 = name2;
+    const index = characters.findIndex(x => x.avatar === session.avatar);
+    try {
+        if (index !== -1) {
+            this_chid = String(index);
+        }
+        name2 = session.name2;
+        return fn();
+    } finally {
+        this_chid = previousChid;
+        name2 = previousName2;
+    }
+}
+
+/**
+ * Writes a reply into the chat snapshot of a detached generation, the same way {@link saveReply} does for the open chat.
+ * @param {import('./scripts/chat-session-guard.js').GenerationSession} session
+ * @param {object} reply
+ * @param {string} reply.type Generation type
+ * @param {string} reply.message Cleaned up message text
+ * @param {string} reply.title Message title
+ * @param {string} reply.reasoning Reasoning text
+ * @param {string?} reply.reasoningSignature Reasoning signature
+ * @param {string[]} reply.swipes Extra swipes
+ * @param {number} reply.placeholderId Index of the streaming placeholder message, or -1
+ * @returns {ChatMessage?} The message that received the reply
+ */
+function applyDetachedReply(session, { type, message, title, reasoning, reasoningSignature, swipes, placeholderId }) {
+    const targetChat = session.ownerChat;
+    const generationFinished = new Date();
+    const fill = (/** @type {ChatMessage} */ target, { appendReasoning = false, keepReasoning = false } = {}) => {
+        if (!target.extra || typeof target.extra !== 'object') {
+            target.extra = {};
+        }
+        target.mes = message;
+        target.title = title;
+        target.gen_started = session.generationStarted;
+        target.gen_finished = generationFinished;
+        target.send_date = getMessageTimeStamp();
+        target.extra.api = session.api;
+        target.extra.model = session.model;
+        if (appendReasoning) {
+            target.extra.reasoning = (target.extra.reasoning || '') + reasoning;
+        } else if (reasoning || !keepReasoning) {
+            target.extra.reasoning = reasoning;
+            target.extra.reasoning_duration = null;
+        }
+        target.extra.reasoning_signature = reasoningSignature;
+    };
+
+    /** @type {ChatMessage} */
+    let target;
+    const lastMessage = targetChat[targetChat.length - 1];
+    const isNewMessageType = !['swipe', 'continue', 'appendFinal'].includes(type);
+
+    if (placeholderId >= 0 && targetChat[placeholderId]) {
+        target = targetChat[placeholderId];
+        const isEmpty = !message && !reasoning && ['', '...'].includes(target.mes);
+        if (isEmpty && isNewMessageType) {
+            targetChat.splice(placeholderId, 1);
+            return null;
+        }
+        if (isNewMessageType && power_user.trim_spaces) {
+            message = message.trim();
+        }
+        fill(target, { keepReasoning: true });
+    } else {
+        if (isNewMessageType || (type === 'swipe' && (lastMessage?.swipe_id === undefined || lastMessage?.is_user))) {
+            type = 'normal';
+        }
+        if (type === 'swipe') {
+            target = lastMessage;
+            target.swipes.length++;
+            if (target.swipe_id === target.swipes.length - 1) {
+                fill(target);
+            } else {
+                target.mes = message;
+            }
+        } else if (type === 'continue' || type === 'appendFinal') {
+            target = lastMessage;
+            fill(target, { appendReasoning: true });
+        } else {
+            if (!message && !reasoning) {
+                return null;
+            }
+            if (power_user.trim_spaces) {
+                message = message.trim();
+            }
+            target = /** @type {ChatMessage} */ ({ name: session.name2, is_user: false, mes: '', extra: {} });
+            fill(target);
+            if (session.groupId) {
+                target.force_avatar = session.forceAvatar;
+                target.original_avatar = session.avatar;
+                target.extra.gen_id = session.groupGenerationId;
+            }
+            targetChat.push(target);
+        }
+    }
+
+    const swipeInfo = () => ({
+        send_date: target.send_date,
+        gen_started: target.gen_started,
+        gen_finished: target.gen_finished,
+        extra: structuredClone(target.extra),
+    });
+    if (!Array.isArray(target.swipe_info)) {
+        target.swipe_info = [];
+    }
+    if (typeof target.swipe_id === 'number' && Array.isArray(target.swipes)) {
+        target.swipes[target.swipe_id] = target.mes;
+        target.swipe_info[target.swipe_id] = swipeInfo();
+    } else {
+        target.swipe_id = 0;
+        target.swipes = [target.mes];
+        target.swipe_info = [swipeInfo()];
+    }
+
+    if (Array.isArray(swipes) && swipes.length > 0) {
+        for (const swipe of swipes) {
+            const info = swipeInfo();
+            delete info.extra.token_count;
+            delete info.extra.reasoning;
+            delete info.extra.reasoning_duration;
+            target.swipes.push(swipe);
+            target.swipe_info.push(info);
+        }
+    }
+
+    return target;
+}
+
+/**
+ * Finishes a generation whose chat was switched away: writes the reply into the snapshot of its
+ * original chat and saves that chat file. The open chat and the UI are not touched.
+ * @param {import('./scripts/chat-session-guard.js').GenerationSession} session Detached session
+ * @param {object} params
+ * @param {string} params.type Generation type
+ * @param {boolean} params.isContinue Whether this is a continuation
+ * @param {string} [params.text] Raw streamed text (including the continued message)
+ * @param {object} [params.data] Raw API response (non-streaming)
+ * @param {string} [params.continueMessage] Continued message text (non-streaming)
+ * @param {any} [params.error] Generation error
+ * @returns {Promise<void>}
+ */
+async function finishDetachedGeneration(session, { type, isContinue, text = '', data = null, continueMessage = '', error = null }) {
+    markGenerationFinalizing(session);
+    const processor = session.processor;
+    const placeholderId = processor?.messageId ?? -1;
+
+    try {
+        if (error) {
+            throw error;
+        }
+
+        let message = text;
+        let title = '';
+        let reasoning = processor?.rawReasoning ?? '';
+        let reasoningSignature = processor?.reasoningSignature ?? null;
+        let imageUrls = processor?.images ?? [];
+        let swipes = processor?.swipes ?? [];
+
+        if (data) {
+            if (data.error) {
+                throw new Error(data?.response || 'API error');
+            }
+            message = extractMessageFromData(data);
+            title = extractTitleFromData(data);
+            reasoning = extractReasoningFromData(data);
+            reasoningSignature = extractReasoningSignatureFromData(data);
+            imageUrls = extractImagesFromData(data);
+            swipes = extractMultiSwipes(data, type);
+            if (isContinue) {
+                message = continueMessage + message;
+            }
+        }
+
+        withSessionCharacter(session, () => {
+            const clean = (/** @type {string} */ value, /** @type {boolean} */ continued) => cleanUpMessage({
+                getMessage: value,
+                isImpersonate: false,
+                isContinue: continued,
+                displayIncompleteSentences: false,
+                stoppingStrings: processor?.stoppingStrings,
+            });
+            message = clean(message, isContinue);
+            swipes = swipes.map(x => clean(x, false));
+            reasoning = getRegexedString(reasoning || '', regex_placement.REASONING);
+        });
+
+        if (power_user.trim_spaces) {
+            reasoning = reasoning.trim();
+        }
+
+        // Reasoning embedded in the text, e.g. <think> blocks
+        if (!reasoning && power_user.reasoning.auto_parse) {
+            const parsed = parseReasoningFromString(message);
+            if (parsed?.reasoning) {
+                reasoning = parsed.reasoning;
+                message = parsed.content;
+            }
+        }
+
+        const target = applyDetachedReply(session, { type, message, title, reasoning, reasoningSignature, swipes, placeholderId });
+        if (target) {
+            await processImageAttachment(target, { imageUrls });
+        }
+    } catch (generationError) {
+        console.error('Background generation failed', generationError);
+        error = generationError;
+        // Drop an empty streaming placeholder
+        const placeholder = session.ownerChat[placeholderId];
+        if (placeholder && ['', '...'].includes(placeholder.mes) && !['swipe', 'continue'].includes(type)) {
+            session.ownerChat.splice(placeholderId, 1);
+        }
+    }
+
+    await persistDetachedSession(session, { error });
 }
 
 /**
@@ -7662,10 +8077,17 @@ export async function getChat() {
             chat.splice(0, chat.length);
             chat_metadata = {};
         }
+        // A background generation holds a newer version of this chat
+        const restored = restoreBackgroundChat();
+        if (restored) {
+            chat_metadata = restored.metadata;
+            chat.splice(0, chat.length, ...restored.chat);
+        }
         if (!chat_metadata.integrity) {
             chat_metadata.integrity = uuidv4();
         }
         await getChatResult();
+        resumeBackgroundChat(restored);
         eventSource.emit(event_types.CHAT_LOADED, { detail: { id: this_chid, character: characters[this_chid] } });
 
         // Focus on the textarea if not already focused on a visible text input
@@ -11156,7 +11578,15 @@ jQuery(async function () {
         $('#option_continue').trigger('click');
     });
 
-    const userInputGenerateMutex = new SimpleMutex(sendTextareaMessage);
+    const userInputGenerateMutex = new SimpleMutex(async () => {
+        // Unlock as soon as the generation moves to the background, so the newly opened chat can send.
+        const release = waitForForegroundRelease();
+        try {
+            await Promise.race([sendTextareaMessage(), release.promise]);
+        } finally {
+            release.cancel();
+        }
+    });
     $('#send_but').on('click', async function () {
         await userInputGenerateMutex.update();
     });
@@ -11595,7 +12025,8 @@ jQuery(async function () {
             if (this_chid === undefined && !is_send_press && !selected_group) {
                 await openPermanentAssistantCard();
             }
-            if ((selected_group && !is_group_generating) || (this_chid !== undefined && !is_send_press) || fromSlashCommand) {
+            // Switching chats mid-generation is safe: the generation continues in the background.
+            if (selected_group || this_chid !== undefined || fromSlashCommand) {
                 await displayPastChats();
                 //this is just to avoid the shadow for past chat view when using /delchat
                 //however, the dialog popup still gets one..
@@ -11611,7 +12042,7 @@ jQuery(async function () {
                 }
             }
         } else if (id == 'option_start_new_chat') {
-            if ((selected_group || this_chid !== undefined) && !is_send_press) {
+            if (selected_group || this_chid !== undefined) {
                 let deleteCurrentChat = false;
                 const result = await Popup.show.confirm(t`Start new chat?`, await renderTemplateAsync('newChatConfirm'), {
                     onClose: () => { deleteCurrentChat = !!$('#del_chat_checkbox').prop('checked'); },

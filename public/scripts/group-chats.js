@@ -87,6 +87,7 @@ import { POPUP_TYPE, Popup, callGenericPopup } from './popup.js';
 import { t } from './i18n.js';
 import { accountStorage } from './util/AccountStorage.js';
 import { compressRequest } from './request-compression.js';
+import { restoreBackgroundChat, resumeBackgroundChat } from './chat-session-guard.js';
 
 export {
     selected_group,
@@ -264,13 +265,21 @@ export async function getGroupChat(groupId, reload = false) {
     await unshallowGroupMembers(groupId);
 
     const chat_id = group.chat_id;
-    const data = await loadGroupChat(chat_id);
-    const metadata = data?.[0]?.chat_metadata ?? {};
-    const freshChat = !metadata.tainted && (!Array.isArray(data) || !data.length);
+    let data = await loadGroupChat(chat_id);
+    let metadata = data?.[0]?.chat_metadata ?? {};
+    let freshChat = !metadata.tainted && (!Array.isArray(data) || !data.length);
 
     // Remove chat file header if present
     if (Array.isArray(data) && data.length && Object.hasOwn(data[0], 'chat_metadata')) {
         data.shift();
+    }
+
+    // A background generation holds a newer version of this chat
+    const restored = restoreBackgroundChat();
+    if (restored) {
+        data = restored.chat.slice();
+        metadata = restored.metadata;
+        freshChat = false;
     }
 
     // Add integrity slug if missing
@@ -317,6 +326,7 @@ export async function getGroupChat(groupId, reload = false) {
 
     await eventSource.emit(event_types.CHAT_CHANGED, getCurrentChatId());
     if (freshChat) await eventSource.emit(event_types.GROUP_CHAT_CREATED);
+    resumeBackgroundChat(restored);
 }
 
 /**
@@ -1047,9 +1057,14 @@ async function generateGroupWrapper(byAutoMode, type = null, params = {}) {
             }
         }
         await eventSource.emit(event_types.GROUP_WRAPPER_STARTED, { selected_group, type });
+        // The user may switch to another chat of this group; remaining members must not reply there.
+        const ownerChatId = group.chat_id;
         // now the real generation begins: cycle through every activated character
         for (const chId of activatedMembers) {
             throwIfAborted();
+            if (group.chat_id !== ownerChatId) {
+                break;
+            }
             deactivateSendButtons();
             setCharacterId(chId);
             setCharacterName(characters[chId].name);
@@ -1061,6 +1076,9 @@ async function generateGroupWrapper(byAutoMode, type = null, params = {}) {
             // Wait for generation to finish
             const generateType = ['swipe', 'impersonate', 'quiet', 'continue'].includes(type) ? type : 'normal';
             textResult = await Generate(generateType, { automatic_trigger: byAutoMode, ...(params || {}) });
+            if (group.chat_id !== ownerChatId) {
+                break;
+            }
             let messageChunk = textResult?.messageChunk;
 
             if (messageChunk) {
