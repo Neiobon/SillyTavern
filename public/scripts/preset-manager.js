@@ -3,6 +3,7 @@ import { Fuse, lodash } from '../lib.js';
 import {
     amount_gen,
     characters,
+    chat_metadata,
     eventSource,
     event_types,
     getRequestHeaders,
@@ -41,12 +42,16 @@ import {
 } from './textgen-settings.js';
 import { download, ensurePlainObject, equalsIgnoreCaseAndAccents, getSanitizedFilename, parseJsonFile, waitUntilCondition } from './utils.js';
 
+import { CHAT_STATE_KEY, isChatState } from './chat-state-utils.js';
+
 const presetManagers = {};
 
 /**
  * Automatically select a preset for current API based on character or group name.
  */
-function autoSelectPreset() {
+async function autoSelectPreset() {
+    // CC chat records take priority, including missing preset names (leave the current preset alone).
+    if (main_api === 'openai' && isChatState(chat_metadata[CHAT_STATE_KEY])) return;
     const presetManager = getPresetManager();
 
     if (!presetManager) {
@@ -71,7 +76,7 @@ function autoSelectPreset() {
 
     if (preset !== undefined && preset !== null) {
         console.log(`Preset found for API: ${main_api}, name: ${name}`);
-        presetManager.selectPreset(preset);
+        await presetManager.selectPreset(preset);
     }
 }
 

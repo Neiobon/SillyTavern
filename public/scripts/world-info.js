@@ -25,6 +25,8 @@ import { accountStorage } from './util/AccountStorage.js';
 import { getOrCreatePersonaDescriptor, setPersonaDescription, user_avatar } from './personas.js';
 import { getCurrentUserHandle } from './user.js';
 import { createWorldInfoSync, worldInfoEquals } from './world-info-sync.js';
+import { getChatState, getChatEntryState, normalizeChatEntryOverride, recordGlobalBooks, setChatEntryOverride } from './chat-state.js';
+import { applyEntryOverrides } from './chat-state-utils.js';
 
 export const world_info_insertion_strategy = {
     evenly: 0,
@@ -851,6 +853,21 @@ export function updateWorldInfoSettings(settings, activeWorldInfo) {
     }
 
     saveSettingsDebounced();
+    recordGlobalBooks();
+}
+
+/** Restore the global selection through its regular UI handler (including settings persistence).
+ * @param {string[]} names Lorebook names
+ */
+export function setGlobalWorldInfoSelection(names) {
+    $('#world_info').val(names.map(name => String(world_names.indexOf(name))).filter(value => value !== '-1')).trigger('change');
+}
+
+/** Repaint switches on chat changes without rebuilding or modifying the editable book. */
+export function refreshWorldInfoChatState() {
+    $('#world_popup_entries_list .world_entry').each(function () {
+        $(this).data('refreshChatState')?.();
+    });
 }
 
 export const world_info_position = {
@@ -3349,21 +3366,39 @@ function handleEntryStateSelectorHelper({ entryStateSelector, entry, data, name 
  * @param {JQuery<HTMLElement>} params.template - The template element for the entry.
  */
 function handleEntryKillSwitchHelper({ entryKillSwitch, entry, data, name, template }) {
+    const reset = $('<button type="button" class="chat_entry_override_reset" title="清除此条目的会话覆盖，使用世界书原始开关">本会话 ↺</button>');
+    entryKillSwitch.after(reset);
+    const refresh = () => {
+        const state = getChatEntryState(name, data.entries[entry.uid]);
+        template.toggleClass('disabledWIEntry', state.disabled);
+        template.toggleClass('chatWIEntryOverride', state.overridden);
+        entryKillSwitch.toggleClass('fa-toggle-off', state.disabled);
+        entryKillSwitch.toggleClass('fa-toggle-on', !state.disabled);
+        entryKillSwitch.attr('title', getCurrentChatId()
+            ? '仅切换本会话中的开关，不修改世界书文件'
+            : '切换世界书条目开关（修改世界书文件）');
+        reset.toggle(state.overridden);
+    };
+    template.data('refreshChatState', refresh);
+    reset.on('click', function (event) {
+        event.stopPropagation();
+        setChatEntryOverride(name, entry.uid, undefined, data.entries[entry.uid].disable);
+    });
     entryKillSwitch.data('uid', entry.uid);
-    entryKillSwitch.on('click', async function () {
+    entryKillSwitch.on('click', async function (event) {
+        event.stopPropagation();
         const uid = entry.uid;
-        data.entries[uid].disable = !data.entries[uid].disable;
-        const isActive = !data.entries[uid].disable;
-        setWIOriginalDataValue(data, uid, 'enabled', isActive);
-        template.toggleClass('disabledWIEntry', !isActive);
-        entryKillSwitch.toggleClass('fa-toggle-off', !isActive);
-        entryKillSwitch.toggleClass('fa-toggle-on', isActive);
+        const base = data.entries[uid];
+        if (getCurrentChatId()) {
+            setChatEntryOverride(name, uid, !getChatEntryState(name, base).disabled, base.disable);
+            return;
+        }
+        base.disable = !base.disable;
+        setWIOriginalDataValue(data, uid, 'enabled', !base.disable);
+        refresh();
         await saveWorldInfo(name, data);
     });
-    const isActive = !entry.disable;
-    template.toggleClass('disabledWIEntry', !isActive);
-    entryKillSwitch.toggleClass('fa-toggle-off', !isActive);
-    entryKillSwitch.toggleClass('fa-toggle-on', isActive);
+    refresh();
 }
 
 /**
@@ -4614,6 +4649,8 @@ export async function getSortedEntries() {
             getPersonaLore(),
         ]);
 
+        // Normalize against book values before extensions can modify the scan copies.
+        for (const entry of [...globalLore, ...characterLore, ...chatLore, ...personaLore]) normalizeChatEntryOverride(entry.world, entry);
         await eventSource.emit(event_types.WORLDINFO_ENTRIES_LOADED, { globalLore, characterLore, chatLore, personaLore });
 
         let entries;
@@ -4636,6 +4673,9 @@ export async function getSortedEntries() {
 
         // Chat lore always goes first, then persona lore, then the rest
         entries = [...chatLore.sort(sortFn), ...personaLore.sort(sortFn), ...entries];
+
+        // Chat switches are applied to scan copies only, never editor/cache data.
+        entries = applyEntryOverrides(entries, getChatState());
 
         // Calculate hash and parse decorators. Split maps to preserve old hashes.
         entries = entries.map((entry) => {
@@ -6190,11 +6230,12 @@ export function initWorldInfo() {
     worldInfoSync.start();
     $('#world_info').on('mousedown change', async function (e) {
         // If there's no world names, don't do anything
-        if (world_names.length === 0) {
+        if (e.type === 'mousedown' && world_names.length === 0) {
             e.preventDefault();
             return;
         }
 
+        // A change must still clear the selection when the last book was deleted.
         onWorldInfoChange('__notSlashCommand__');
     });
 

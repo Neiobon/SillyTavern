@@ -22,6 +22,7 @@ import {
 import { RA_CountCharTokens, humanizedDateTime, dragElement, favsToHotswap, getMessageTimeStamp } from './RossAscends-mods.js';
 import { power_user, loadMovingUIState, sortEntitiesList } from './power-user.js';
 import { debounce_timeout } from './constants.js';
+import { flushChatStateSave } from './chat-state.js';
 
 import {
     chat,
@@ -2048,6 +2049,7 @@ export async function openGroupById(groupId) {
         select_group_chats(groupId, false);
 
         if (selected_group !== groupId) {
+            await flushChatStateSave();
             groupChatQueueOrder = new Map();
             setCharacterId(undefined);
             setCharacterName('');

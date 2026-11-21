@@ -279,6 +279,7 @@ import { event_types, eventSource } from './scripts/events.js';
 import { initAccessibility } from './scripts/a11y.js';
 import { applyStreamFadeIn } from './scripts/util/stream-fadein.js';
 import { beginGenerationSession, commitGenerationSession, endGenerationSession, initChatSessionGuard, markGenerationFinalizing, markGenerationFinishing, persistDetachedSession, prepareChatSwitch, restoreBackgroundChat, resumeBackgroundChat, waitForForegroundRelease } from './scripts/chat-session-guard.js';
+import { initChatState, flushChatStateSave } from './scripts/chat-state.js';
 import { initDomHandlers } from './scripts/dom-handlers.js';
 import { SimpleMutex } from './scripts/util/SimpleMutex.js';
 import { AudioPlayer } from './scripts/audio-player.js';
@@ -766,6 +767,7 @@ async function firstLoadInit() {
     await initSlashCommandAutoComplete();
     initMacroAutoComplete();
     initWorldInfo();
+    initChatState();
     initHorde();
     initRossMods();
     initStats();
@@ -892,6 +894,7 @@ export async function selectCharacterById(id, { switchMenu = true } = {}) {
         //if clicked on a different character from what was currently selected
         if (!is_send_press) {
             // Let a reply that is being written into the current chat finish first
+            await flushChatStateSave();
             await prepareChatSwitch();
             setCharacterId(undefined);
             setCharacterName('');
@@ -1588,6 +1591,7 @@ export function cancelDebouncedChatSave() {
  * @param {boolean} [options.clearData=false] Optionally clear the chat array's contents.
  */
 export async function clearChat({ clearData = false } = {}) {
+    await flushChatStateSave();
     if (clearData) {
         // A generation running in this chat continues in the background.
         await prepareChatSwitch();
